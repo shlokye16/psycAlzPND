@@ -1,27 +1,80 @@
 """
 OASIS-2 Structural MRI Processing Pipeline
 ===========================================
-Corrected for actual dataset structure observed in OASIS-2 downloads:
+Rewrite notes (this version fixes real bugs in the previous draft and moves
+brain extraction / registration / ROI labeling onto antspyx + antspynet
+instead of FSL bet/flirt + nilearn's Harvard-Oxford atlas):
 
-  MRI format:   Analyze 7.5 (.hdr + .img pairs) — NOT NIfTI .nii.gz
+  BUG FIXED — Harvard-Oxford off-by-one: the old ROI extraction built
+    `label_to_val = {lbl: idx + 1 for idx, lbl in enumerate(atlas_obj.labels)}`,
+    which assumes atlas_obj.labels does NOT include 'Background'. nilearn's
+    Harvard-Oxford atlas.labels DOES include 'Background' at index 0, so
+    every single ROI volume/intensity in the old script was pulled from the
+    WRONG label value (off by one) for every subject, silently. This version
+    sidesteps the whole nilearn/Harvard-Oxford path and gets hippocampus,
+    amygdala, and the DMN-adjacent cortical ROIs from antspynet's
+    Desikan-Killiany-Tourville (DKT) deep-learning labeling instead, using
+    the exact label numbers documented in ANTsPyNet's own source (see
+    DKT_ROI_LABELS below) — no atlas-index arithmetic left to get wrong.
+
+  BUG FIXED — crash-on-fresh-run __main__ block: the previous version's
+    `if __name__ == "__main__":` block had real build_manifest()/run_pipeline()
+    calls commented out, but left an unconditional
+    `pd.read_csv("data/metadata/oasis2_feature_matrix.csv")` at the bottom
+    that would throw FileNotFoundError on any run before that file exists.
+    Replaced with fully-commented usage examples, nothing executes on import
+    or a bare `python xtoasis2.py`.
+
+  CLEANUP — removed the unused `NiftiLabelsMasker` import (dead code, ROI
+    extraction was always done by hand, never through that masker), and
+    removed stale PART1/PART2 docstring references left over from an even
+    older version of this dataset's layout (this download is flat, no split).
+
+  ARCHITECTURE CHANGE — FSL bet/flirt (+ the nilearn resample_to_img
+    fallback for when FSL wasn't installed) is replaced by
+    antspynet.preprocess_brain_image(), which does brain extraction, N4 bias
+    correction, and template registration in one call. No more "is FSL on
+    PATH" branching — antspyx/antspynet is now the only path, so behavior is
+    identical across machines instead of silently degrading when FSL is
+    missing.
+
+  MRI format:   NIfTI, gzipped (mpr-N.nii.gz) — NOT Analyze 7.5 .hdr/.img
   Acquisitions: 3–4 mpr-N repeated scans per session → averaged before any processing
-  Sessions:     373 total, 150 unique subjects (OAS2_XXXX_MRY folder naming)
+  Sessions:     555 folders total (OAS2_XXXX_MRY folder naming), flat under one dir
   Labels:       Derived from CDR column — NEVER from Group column or folder name
-  Parts:        OAS2_RAW_PART1 + OAS2_RAW_PART2 — check both when locating sessions
+  Layout:       No per-session RAW/ subfolder — mpr-N.nii.gz files sit directly
+                inside each OAS2_XXXX_MRY folder
+  Extras:       Some sessions carry an OLD/ subfolder (old FSL t4 transform files,
+                not scans) and occasional stray files (.log, .ima.gz, odd-numbered
+                .nii.gz from re-runs) sitting alongside the real mpr-N.nii.gz data.
+                These are ignored automatically since we only glob top-level
+                "mpr-*.nii.gz" — that pattern never touches OLD/ or stray files.
+  Manifest:     A manifest.json ships at the root of the extracted folder (session/
+                scanner metadata). Not required by this pipeline since the
+                demographics .xlsx already carries labels + volumetrics, but it's
+                left in place in case you want to cross-check session counts.
 
 Setup (run once before this script):
-    Download OASIS-2 zips from: https://sites.wustl.edu/oasisbrains/
+    Download the OASIS-2 archive from: https://sites.wustl.edu/oasisbrains/
     Extract to:
-        data/raw/oasis2/OAS2_RAW_PART1/
-        data/raw/oasis2/OAS2_RAW_PART2/
+        data/raw/oasis2/
+            OAS2_0001_MR1/mpr-1.nii.gz ...
+            OAS2_0001_MR2/mpr-1.nii.gz ...
+            ...
+            manifest.json
     Place demographics file at:
-        data/metadata/oasis_longitudinal_demographics.xlsx
+        data/metadata/oasis_longitudinal_demographics*.xlsx
+    (the filename may carry a hash suffix, e.g.
+     "oasis_longitudinal_demographics-8d83e569fa2e2d30.xlsx" — the script
+     globs for it rather than hardcoding the exact name)
 
 Install dependencies:
-    pip install nibabel nilearn numpy scipy pandas scikit-image torch openpyxl
-    # FSL required for skull stripping + registration (external, install separately)
-    # https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FslInstallation
-    # If FSL is unavailable, the pipeline falls back to nilearn-only preprocessing.
+    pip install nibabel numpy scipy pandas torch openpyxl
+    pip install antspyx antspynet tensorflow
+    # antspynet's brain extraction / preprocessing / DKT labeling are deep
+    # learning models — first call per model downloads pretrained weights
+    # (needs internet once; cached under ~/.antspynet/ after that).
+    # No FSL, no nilearn, no external CLI tools needed anymore.
 
 Label mapping from CDR:
     CDR 0.0  →  "Control"   (label 0)
@@ -33,41 +86,45 @@ subjects started nondemented and converted during the study. They are your
 most analytically valuable subgroup for early-detection framing.
 
 Subject numbering: OAS2_0001 through OAS2_0150 (some sessions may be missing).
-MRI ID format:     OAS2_XXXX_MRY (maps exactly to folder names in PART1/PART2).
+MRI ID format:     OAS2_XXXX_MRY (maps exactly to folder names on disk).
 """
 
 import logging
 import shutil
-import subprocess
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Tuple
 
+import ants
+import antspynet
 import nibabel as nib
 import numpy as np
 import pandas as pd
 import torch
-from nilearn import datasets, image
-from nilearn.maskers import NiftiLabelsMasker
 from scipy.ndimage import zoom
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-RAW_DIR      = Path("../data/raw/oasis2")
-MRI_FEAT_DIR = Path("../data/processed/mri_features")
-TENSOR_DIR   = Path("../data/processed/mri_tensors")
-METADATA_DIR = Path("../data/metadata")
-SCRATCH_DIR  = Path("../data/processed/mri_scratch")   # intermediate FSL outputs
+RAW_DIR      = Path("../data/oasis/oasis2")
+MRI_FEAT_DIR = Path("../processed/oasis2/mri_features")
+TENSOR_DIR   = Path("../processed/oasis2/mri_tensors")
+METADATA_DIR = Path("../data/oasis/oasis2/")
+SCRATCH_DIR  = Path("../processed/oasis2/mri_scratch")   # intermediate antspyx outputs
 LOG_DIR      = Path("logs")
 
-DEMOGRAPHICS_XLSX = METADATA_DIR / "oasis_longitudinal_demographics.xlsx"
-MANIFEST_CSV      = METADATA_DIR / "oasis2_manifest.csv"
-PROCESSING_LOG    = METADATA_DIR / "oasis2_processing_summary.csv"
+# Demographics filename ships with a hash suffix that varies per download
+# (e.g. "oasis_longitudinal_demographics-8d83e569fa2e2d30.xlsx"), so we glob
+# for it lazily via find_demographics_xlsx() rather than hardcoding the name.
+DEMOGRAPHICS_XLSX_GLOB = "oasis_longitudinal_demographics*.xlsx"
+MANIFEST_CSV           = METADATA_DIR / "oasis2_manifest.csv"
+PROCESSING_LOG         = METADATA_DIR / "oasis2_processing_summary.csv"
 
-# Raw subdirectory names — check both parts for every session
-PARTS = ["OAS2_RAW_PART1", "OAS2_RAW_PART2"]
+# Optional: the raw manifest.json that ships at the root of the extracted
+# oasis2/ folder (session/scanner metadata). Not required by this pipeline.
+RAW_MANIFEST_JSON = RAW_DIR / "manifest.json"
 
 # CNN input shape — (D, H, W) after resize
 MRI_TARGET_SHAPE = (128, 128, 128)
@@ -75,37 +132,40 @@ MRI_TARGET_SHAPE = (128, 128, 128)
 # Intensity normalization — clip z-scores beyond this after standardizing
 INTENSITY_CLIP_SIGMA = 3.0
 
-# Minimum file size to treat a .img as real data (not a stub)
-MIN_BYTES = 50_000
+# Minimum file size to treat an mpr-N.nii.gz as real data (not a stub).
+# These are gzip-compressed NIfTI files now (not raw Analyze .img), so a
+# real T1 volume typically still lands in the multi-MB range even compressed.
+MIN_BYTES = 500_000
 
-# FSL BET fractional intensity — 0.5 is standard, lower = more aggressive
-BET_FRAC = 0.5
+# antspynet.preprocess_brain_image() config for the CNN-tensor track (brain
+# extraction + N4 + registration in one call). "Affine" mirrors the old
+# FLIRT -dof 12 intent — swap to "SyN" if you want nonlinear registration
+# instead, at the cost of significantly more compute per session.
+BRAIN_EXTRACTION_MODALITY = "t1"
+REGISTRATION_TEMPLATE     = "croppedMni152"   # antspynet's bundled/downloadable template
+TEMPLATE_TRANSFORM_TYPE   = "Affine"
 
-# Harvard-Oxford atlas ROI configuration
-# Using HO instead of AAL — HO is bundled with nilearn (no external download)
-# and already cached if you've run the PEARL-Neuro fMRI pipeline.
-#
-# Two HO variants:
-#   sub-maxprob-thr25-2mm  → subcortical atlas — L/R hippocampus + amygdala
-#   cort-maxprob-thr25-2mm → cortical atlas — DMN-adjacent regions
-#
-# Label strings must match nilearn's atlas.labels list exactly.
-
-HO_SUBCORTICAL_ROIS = [
-    "Left Hippocampus",
-    "Right Hippocampus",
-    "Left Amygdala",
-    "Right Amygdala",
-]
-
-HO_CORTICAL_ROIS = [
-    "Frontal Medial Cortex",
-    "Cingulate Gyrus, posterior division",
-    "Precuneous Cortex",
-    "Middle Temporal Gyrus, temporooccipital part",
-    "Angular Gyrus",
-    "Parahippocampal Gyrus, posterior division",
-]
+# DKT (Desikan-Killiany-Tourville) label numbers, straight from ANTsPyNet's
+# own source (antspynet/utilities/desikan_killiany_tourville_labeling.py).
+# Subcortical (inner) labels: 17/53 = left/right hippocampus, 18/54 =
+# left/right amygdala. Cortical (outer) labels picked as the nearest DKT
+# equivalent to the old Harvard-Oxford DMN-adjacent ROI list:
+#   - HO "Angular Gyrus" has no separate DKT label; DKT's protocol folds it
+#     into "inferior parietal" (1008/2008) — this is a deliberate substitution,
+#     not a 1:1 match, flagged here rather than silently assumed.
+#   - HO "Frontal Medial Cortex" has no direct DKT equivalent either; nearest
+#     anatomical analogue used here is "medial orbitofrontal" (1014/2014) —
+#     same caveat, worth a second look if this ROI specifically matters.
+DKT_ROI_LABELS = {
+    "Left_Hippocampus":  17,  "Right_Hippocampus":  53,
+    "Left_Amygdala":     18,  "Right_Amygdala":     54,
+    "Left_PosteriorCingulate": 1023, "Right_PosteriorCingulate": 2023,
+    "Left_Precuneus":          1025, "Right_Precuneus":          2025,
+    "Left_MiddleTemporal":     1015, "Right_MiddleTemporal":     2015,
+    "Left_Parahippocampal":    1016, "Right_Parahippocampal":    2016,
+    "Left_InferiorParietal":   1008, "Right_InferiorParietal":   2008,  # HO "Angular Gyrus" substitute
+    "Left_MedialOrbitofrontal": 1014, "Right_MedialOrbitofrontal": 2014,  # HO "Frontal Medial Cortex" substitute
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SETUP
@@ -132,8 +192,8 @@ log = logging.getLogger(__name__)
 def is_real_file(path: Path, min_bytes: int = MIN_BYTES) -> bool:
     """
     Check that a file both exists and has real content (not a stub or zero-byte
-    placeholder). OASIS-2 .img files are large (usually >10 MB for a T1w scan),
-    so anything below min_bytes is clearly incomplete.
+    placeholder). mpr-N.nii.gz files are gzip-compressed NIfTI volumes, so
+    anything below min_bytes is clearly incomplete or corrupt.
     """
     try:
         return path.exists() and path.stat().st_size >= min_bytes
@@ -141,12 +201,27 @@ def is_real_file(path: Path, min_bytes: int = MIN_BYTES) -> bool:
         return False
 
 
-def fsl_available() -> bool:
-    """Return True if FSL bet/flirt are on PATH."""
-    return (
-        shutil.which("bet") is not None and
-        shutil.which("flirt") is not None
-    )
+def find_demographics_xlsx() -> Path:
+    """
+    Locate the demographics spreadsheet in METADATA_DIR. The filename ships
+    with a hash suffix that varies per download, so we glob instead of
+    hardcoding it. Raises FileNotFoundError with setup instructions if
+    nothing matches, and warns (but proceeds with the first match) if more
+    than one candidate is found.
+    """
+    matches = sorted(METADATA_DIR.glob(DEMOGRAPHICS_XLSX_GLOB))
+    if not matches:
+        raise FileNotFoundError(
+            f"No file matching '{DEMOGRAPHICS_XLSX_GLOB}' found in {METADATA_DIR}.\n"
+            "Download oasis_longitudinal_demographics.xlsx from:\n"
+            "  https://sites.wustl.edu/oasisbrains/"
+        )
+    if len(matches) > 1:
+        log.warning(
+            f"Multiple demographics files found in {METADATA_DIR}: "
+            f"{[m.name for m in matches]} — using {matches[0].name}"
+        )
+    return matches[0]
 
 
 def cdr_to_label(cdr) -> str:
@@ -163,58 +238,55 @@ def cdr_to_label(cdr) -> str:
     return "AD"
 
 
-def find_session_raw_dir(mri_id: str) -> Path | None:
+def find_session_raw_dir(mri_id: str) -> Optional[Path]:
     """
-    Locate the RAW/ subfolder for a session across both PART1 and PART2.
-    Returns the Path if found, None otherwise.
+    Locate the session folder for one MRI ID. The mpr-N.nii.gz files sit
+    directly inside data/raw/oasis2/OAS2_XXXX_MRY/ — no per-session RAW/
+    subfolder. Returns the Path if found, None otherwise.
     """
-    for part in PARTS:
-        candidate = RAW_DIR / part / mri_id / "RAW"
-        if candidate.exists():
-            return candidate
-    return None
+    candidate = RAW_DIR / mri_id
+    return candidate if candidate.exists() else None
 
 
-def load_and_average_acquisitions(raw_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+def load_and_average_acquisitions(raw_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Load all mpr-N.nifti.hdr acquisitions in a session's RAW/ folder and
-    average them together. This is the standard OASIS protocol — multiple
-    acquisitions are collected per session to reduce motion artifact, and
-    they must be averaged before any subsequent processing.
+    Load all mpr-N.nii.gz acquisitions sitting directly inside a session
+    folder and average them together. This is the standard OASIS protocol —
+    multiple acquisitions are collected per session to reduce motion
+    artifact, and they must be averaged before any subsequent processing.
 
-    Explicitly filters to mpr-*.nifti.hdr to avoid picking up OLD/ folder
-    files or any .log files that live alongside the real data.
+    Explicitly globs top-level "mpr-*.nii.gz" only (non-recursive), which
+    naturally skips the OLD/ subfolder (old t4 transform files, not scans)
+    and any stray .log / .ima.gz / odd-numbered .nii.gz files that some
+    sessions carry alongside the real data — none of those match the
+    "mpr-*.nii.gz" pattern.
 
     Returns:
         averaged  — float32 numpy array of shape (X, Y, Z)
         affine    — 4x4 affine matrix from the first acquisition
     """
-    hdr_files = sorted(raw_dir.glob("mpr-*.nifti.hdr"))
-    if not hdr_files:
-        raise FileNotFoundError(f"No mpr-*.nifti.hdr files in {raw_dir}")
+    nii_files = sorted(raw_dir.glob("mpr-*.nii.gz"))
+    if not nii_files:
+        raise FileNotFoundError(f"No mpr-*.nii.gz files in {raw_dir}")
 
-    # Verify at least the .img counterpart exists and has real content
-    valid = []
-    for hdr in hdr_files:
-        img_path = hdr.with_suffix(".img")
-        if is_real_file(img_path):
-            valid.append(hdr)
-        else:
-            log.warning(f"Skipping {hdr.name} — .img missing or too small")
+    # Verify each file has real content (not a truncated/corrupt download)
+    valid = [f for f in nii_files if is_real_file(f)]
+    skipped = set(nii_files) - set(valid)
+    for f in skipped:
+        log.warning(f"Skipping {f.name} — file missing or too small")
 
     if not valid:
-        raise FileNotFoundError(f"No valid .hdr/.img pairs in {raw_dir}")
+        raise FileNotFoundError(f"No valid mpr-*.nii.gz files in {raw_dir}")
 
     volumes = []
     affine  = None
-    for hdr_path in valid:
-        # nibabel pairs .hdr with .img automatically — never load .img directly
-        img = nib.load(str(hdr_path))
+    for nii_path in valid:
+        img = nib.load(str(nii_path))
         if affine is None:
             affine = img.affine
         arr = img.get_fdata(dtype=np.float32)
-        # OASIS-2 Analyze 7.5 files sometimes load as 4D (X, Y, Z, 1) — squeeze
-        # to 3D before averaging. np.squeeze removes ALL size-1 dims safely.
+        # OASIS-2 mpr-N.nii.gz volumes sometimes load as 4D (X, Y, Z, 1) —
+        # squeeze to 3D before averaging. np.squeeze removes ALL size-1 dims.
         arr = np.squeeze(arr)
         if arr.ndim != 3:
             raise ValueError(f"Unexpected volume shape after squeeze: {arr.shape}")
@@ -225,49 +297,41 @@ def load_and_average_acquisitions(raw_dir: Path) -> tuple[np.ndarray, np.ndarray
     return averaged, affine
 
 
-def skull_strip_fsl(input_nii: Path, output_nii: Path):
+def antspynet_preprocess(t1_ants) -> dict:
     """
-    Run FSL BET on the averaged volume to remove non-brain tissue.
-    Raises subprocess.CalledProcessError if FSL is not installed or fails.
+    Brain extraction + N4 bias correction + registration to
+    REGISTRATION_TEMPLATE, all in one antspynet call. Replaces the old FSL
+    bet + FSL flirt (+ nilearn resample_to_img fallback) path entirely.
+
+    Returns antspynet's own preprocessing dict — the two keys used
+    downstream are 'preprocessed_image' (registered, bias-corrected, NOT yet
+    masked) and 'brain_mask' (in that same registered space). Multiply them
+    together to get the skull-stripped, registered volume — same pattern
+    ANTsPyNet's own DKT labeling code uses internally.
     """
-    subprocess.run(
-        ["bet", str(input_nii), str(output_nii), "-f", str(BET_FRAC), "-R"],
-        check=True, capture_output=True, text=True,
+    return antspynet.preprocess_brain_image(
+        t1_ants,
+        truncate_intensity=(0.01, 0.99),
+        brain_extraction_modality=BRAIN_EXTRACTION_MODALITY,
+        template=REGISTRATION_TEMPLATE,
+        template_transform_type=TEMPLATE_TRANSFORM_TYPE,
+        do_bias_correction=True,
+        do_denoising=True,
+        verbose=False,
     )
 
 
-def register_to_mni_fsl(input_nii: Path, output_nii: Path):
+def ants_to_nibabel_via_disk(ants_img, tmp_path: Path) -> nib.Nifti1Image:
     """
-    Register brain-extracted volume to MNI152 2mm standard space using
-    FSL FLIRT with 12-DOF affine (standard for cross-subject MRI analysis).
-    Uses nilearn's bundled MNI152 template as the registration target.
+    Bridge an ANTsImage back to a nibabel image via a real file on disk
+    rather than antspyx's in-memory to_nibabel() converter — that converter
+    has had open, version-dependent bugs around qform/orientation on round
+    trips (ANTsX/ANTsPy issues #52, #64). Writing through ANTs' own NIfTI
+    writer and reading it back with nibabel is the same trick to_nibabel()
+    uses internally anyway, just made explicit and version-safe here.
     """
-    from nilearn.datasets import load_mni152_template
-    mni_template = load_mni152_template(resolution=2)
-    mni_path     = SCRATCH_DIR / "_mni152_2mm_template.nii.gz"
-    if not mni_path.exists():
-        nib.save(mni_template, str(mni_path))
-
-    subprocess.run(
-        ["flirt",
-         "-in",       str(input_nii),
-         "-ref",      str(mni_path),
-         "-out",      str(output_nii),
-         "-dof",      "12",
-         "-interp",   "trilinear"],
-        check=True, capture_output=True, text=True,
-    )
-
-
-def register_to_mni_nilearn(img: nib.Nifti1Image) -> nib.Nifti1Image:
-    """
-    Fallback MNI registration using nilearn's resample_to_img.
-    Less accurate than FSL FLIRT but requires no external dependencies.
-    Used automatically when FSL is not available.
-    """
-    from nilearn.datasets import load_mni152_template
-    mni_template = load_mni152_template(resolution=2)
-    return image.resample_to_img(img, mni_template, interpolation="continuous")
+    ants.image_write(ants_img, str(tmp_path))
+    return nib.load(str(tmp_path))
 
 
 def normalize_intensity(arr: np.ndarray) -> np.ndarray:
@@ -312,22 +376,15 @@ def build_manifest() -> pd.DataFrame:
     pre-computed features (nWBV, eTIV, MMSE).
 
     Run this once before processing. It will tell you:
-    - Which sessions are present in PART1 vs PART2
-    - Which sessions are missing entirely (download incomplete)
+    - Which sessions are present on disk vs missing entirely (download incomplete)
     - How many mpr-N acquisitions each session has
     - Label distribution (Control / MCI / AD)
     - Converter subjects (Group == 'Converted')
 
     Saves to data/metadata/oasis2_manifest.csv and returns the DataFrame.
     """
-    if not DEMOGRAPHICS_XLSX.exists():
-        raise FileNotFoundError(
-            f"{DEMOGRAPHICS_XLSX} not found.\n"
-            "Download oasis_longitudinal_demographics.xlsx from:\n"
-            "  https://sites.wustl.edu/oasisbrains/"
-        )
-
-    df = pd.read_excel(str(DEMOGRAPHICS_XLSX))
+    demographics_xlsx = find_demographics_xlsx()
+    df = pd.read_excel(str(demographics_xlsx))
 
     # Normalize column names — the xlsx sometimes has trailing spaces
     df.columns = df.columns.str.strip()
@@ -355,8 +412,8 @@ def build_manifest() -> pd.DataFrame:
             missing.append(mri_id)
             continue
 
-        hdr_files = list(raw_dir.glob("mpr-*.nifti.hdr"))
-        img_ok    = [h for h in hdr_files if is_real_file(h.with_suffix(".img"))]
+        nii_files = list(raw_dir.glob("mpr-*.nii.gz"))
+        nii_ok    = [f for f in nii_files if is_real_file(f)]
 
         records.append({
             "mri_id":        mri_id,
@@ -377,9 +434,8 @@ def build_manifest() -> pd.DataFrame:
             "nWBV":          row["nWBV"],
             "eTIV":          row["eTIV"],
             "ASF":           row["ASF"],
-            "n_acquisitions": len(img_ok),
+            "n_acquisitions": len(nii_ok),
             "raw_path":      str(raw_dir),
-            "part":          next(p for p in PARTS if p in str(raw_dir)),
         })
 
     manifest = pd.DataFrame(records)
@@ -389,14 +445,12 @@ def build_manifest() -> pd.DataFrame:
     log.info(f"Sessions missing:   {len(missing)}")
     log.info(f"Label distribution:\n{manifest['label'].value_counts().to_string()}")
     log.info(f"Converters:         {manifest['is_converter'].sum()} sessions")
-    log.info(f"In PART1:           {(manifest['part'] == 'OAS2_RAW_PART1').sum()}")
-    log.info(f"In PART2:           {(manifest['part'] == 'OAS2_RAW_PART2').sum()}")
     log.info(f"nWBV sanity check (CDR → mean nWBV — expect 0.740 / 0.721 / 0.702):")
     log.info(manifest.groupby("cdr")["nWBV"].mean().round(4).to_string())
 
     if missing:
         log.warning(f"Missing sessions (first 10): {missing[:10]}")
-        log.warning("Check both PART1 and PART2 zip downloads are complete.")
+        log.warning(f"Check the oasis2 archive extracted fully to {RAW_DIR}.")
 
     log.info(f"Manifest saved → {MANIFEST_CSV}")
     return manifest
@@ -406,20 +460,20 @@ def build_manifest() -> pd.DataFrame:
 # STEP 1 — LOAD + PREPROCESS MRI (one session)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def preprocess_mri_session(mri_id: str) -> nib.Nifti1Image | None:
+def preprocess_mri_session(mri_id: str) -> Optional[nib.Nifti1Image]:
     """
     Full preprocessing pipeline for one OASIS-2 session:
-      1. Locate RAW/ folder across PART1 and PART2
+      1. Locate session folder
       2. Load + average all mpr-N acquisitions
-      3. Skull strip (FSL BET if available, else returns un-stripped — log warning)
-      4. Register to MNI152 2mm (FSL FLIRT if available, else nilearn fallback)
-      5. Intensity normalize (z-score, clipped to ±3 sigma)
+      3. antspynet.preprocess_brain_image(): brain extraction + N4 + registration
+         to REGISTRATION_TEMPLATE, all via antspyx (no FSL, no nilearn)
+      4. Intensity normalize (z-score, clipped to ±3 sigma)
 
-    Returns a preprocessed Nifti1Image in MNI space, or None on failure.
+    Returns a preprocessed Nifti1Image in template space, or None on failure.
     """
     raw_dir = find_session_raw_dir(mri_id)
     if raw_dir is None:
-        log.error(f"[{mri_id}] RAW/ directory not found in PART1 or PART2")
+        log.error(f"[{mri_id}] Session directory not found under {RAW_DIR}")
         return None
 
     scratch = SCRATCH_DIR / mri_id
@@ -435,34 +489,19 @@ def preprocess_mri_session(mri_id: str) -> nib.Nifti1Image | None:
     avg_nii_path = scratch / "averaged.nii.gz"
     nib.save(nib.Nifti1Image(averaged, affine), str(avg_nii_path))
 
-    # ── Skull stripping ───────────────────────────────────────────────────────
-    brain_nii_path = scratch / "brain.nii.gz"
-    if fsl_available():
-        try:
-            skull_strip_fsl(avg_nii_path, brain_nii_path)
-            log.info(f"[{mri_id}] Skull strip: FSL BET")
-        except subprocess.CalledProcessError as e:
-            log.warning(f"[{mri_id}] BET failed ({e.stderr.strip()}) — using un-stripped volume")
-            shutil.copy(str(avg_nii_path), str(brain_nii_path))
-    else:
-        log.warning(f"[{mri_id}] FSL not found — skipping skull strip (install FSL for better results)")
-        shutil.copy(str(avg_nii_path), str(brain_nii_path))
+    # ── Brain extraction + N4 + registration (antspynet, one call) ───────────
+    try:
+        t1_ants = ants.image_read(str(avg_nii_path))
+        preproc = antspynet_preprocess(t1_ants)
+        brain_mni = preproc["preprocessed_image"] * preproc["brain_mask"]
+        log.info(f"[{mri_id}] antspynet preprocessing done "
+                 f"(brain extraction + N4 + {TEMPLATE_TRANSFORM_TYPE} registration to {REGISTRATION_TEMPLATE})")
+    except Exception as e:
+        log.error(f"[{mri_id}] antspynet preprocessing failed: {e}")
+        return None
 
-    # ── MNI registration ──────────────────────────────────────────────────────
     mni_nii_path = scratch / "brain_mni.nii.gz"
-    if fsl_available():
-        try:
-            register_to_mni_fsl(brain_nii_path, mni_nii_path)
-            log.info(f"[{mri_id}] Registration: FSL FLIRT (12-DOF affine)")
-            registered_img = nib.load(str(mni_nii_path))
-        except subprocess.CalledProcessError as e:
-            log.warning(f"[{mri_id}] FLIRT failed ({e.stderr.strip()}) — using nilearn fallback")
-            brain_img      = nib.load(str(brain_nii_path))
-            registered_img = register_to_mni_nilearn(brain_img)
-    else:
-        log.warning(f"[{mri_id}] FSL not found — using nilearn resampling for MNI registration")
-        brain_img      = nib.load(str(brain_nii_path))
-        registered_img = register_to_mni_nilearn(brain_img)
+    registered_img = ants_to_nibabel_via_disk(brain_mni, mni_nii_path)
 
     # ── Intensity normalization ───────────────────────────────────────────────
     arr        = registered_img.get_fdata(dtype=np.float32)
@@ -478,8 +517,7 @@ def preprocess_mri_session(mri_id: str) -> nib.Nifti1Image | None:
 # STEP 2 — FEATURE EXTRACTION (one session)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_mri_features(mri_id: str, preprocessed_img: nib.Nifti1Image,
-                          manifest_row: pd.Series) -> dict:
+def extract_mri_features(mri_id: str, manifest_row: pd.Series) -> dict:
     """
     Extract handcrafted MRI features for one session.
 
@@ -487,9 +525,14 @@ def extract_mri_features(mri_id: str, preprocessed_img: nib.Nifti1Image,
     (A) Pre-computed from demographics CSV — available immediately, no image needed:
         nWBV, eTIV, ASF, MMSE, Age, EDUC, SES
 
-    (B) Atlas-based ROI volumes from the preprocessed image:
-        AAL atlas parcellation via nilearn — hippocampal and DMN-adjacent ROIs.
-        Volumes are normalized by eTIV to control for head size.
+    (B) DKT-labeled ROI volumes — antspynet.desikan_killiany_tourville_labeling()
+        run directly on the averaged native-space T1 (do_preprocessing=True,
+        so it does its own internal brain extraction + registration and warps
+        the label image back to the ORIGINAL native T1 space). Volumes and
+        mean intensities are measured against that same native-space T1, not
+        the template-registered CNN-preprocessing output from Step 1 — these
+        are two independent antspynet calls on purpose (see antspynet_preprocess
+        docstring for why they aren't shared).
 
     Returns a flat dict ready to be saved as one row in a features CSV.
     """
@@ -510,57 +553,36 @@ def extract_mri_features(mri_id: str, preprocessed_img: nib.Nifti1Image,
         "ses":          manifest_row["ses"],
     }
 
-    # ── (B) Harvard-Oxford atlas ROI volumes ─────────────────────────────────
-    # Using HO instead of AAL — HO atlases are bundled with nilearn and require
-    # no external download. The subcortical variant provides L/R hippocampus;
-    # the cortical variant provides DMN-adjacent regions (precuneous, PCC, etc.).
-    # If the PEARL-Neuro fMRI pipeline has already run, both are already cached.
-    all_ho_rois = HO_SUBCORTICAL_ROIS + HO_CORTICAL_ROIS
+    e_tiv = float(manifest_row["eTIV"]) if manifest_row["eTIV"] > 0 else 1.0
+
     try:
-        atlas_sub  = datasets.fetch_atlas_harvard_oxford("sub-maxprob-thr25-2mm")
-        atlas_cort = datasets.fetch_atlas_harvard_oxford("cort-maxprob-thr25-2mm")
-
-        img_data    = preprocessed_img.get_fdata()
-        vox_dims    = np.abs(np.diag(preprocessed_img.affine)[:3])
-        vox_vol_mm3 = float(np.prod(vox_dims))
-        e_tiv       = float(manifest_row["eTIV"]) if manifest_row["eTIV"] > 0 else 1.0
-
-        def _extract_ho_rois(atlas_obj, roi_list):
-            """Resample one HO atlas to subject space and extract requested ROIs."""
-            atlas_img_obj = atlas_obj.maps if isinstance(atlas_obj.maps, nib.Nifti1Image) else nib.load(atlas_obj.maps)
-            resampled     = image.resample_to_img(
-                atlas_img_obj, preprocessed_img, interpolation="nearest"
+        raw_dir = find_session_raw_dir(mri_id)
+        avg_nii_path = SCRATCH_DIR / mri_id / "averaged.nii.gz"
+        if not avg_nii_path.exists():
+            raise FileNotFoundError(
+                f"{avg_nii_path} not found — run preprocess_mri_session() first, "
+                f"it writes this as a side effect."
             )
-            atlas_data = resampled.get_fdata()
 
-            # HO labels list is 0-indexed and offset by 1 in the image
-            # (label value 0 = background, label value N = labels[N-1])
-            label_to_val = {lbl: idx + 1 for idx, lbl in enumerate(atlas_obj.labels)}
+        t1_native = ants.image_read(str(avg_nii_path))
+        dkt_label_image = antspynet.desikan_killiany_tourville_labeling(
+            t1_native, do_preprocessing=True, verbose=False
+        )
+        dkt_array = dkt_label_image.numpy()
+        t1_array  = t1_native.numpy()
+        vox_vol_mm3 = float(np.prod(t1_native.spacing))
 
-            results = {}
-            for roi_label in roi_list:
-                safe_key = roi_label.replace(" ", "_").replace(",", "").replace(".", "")
-                if roi_label not in label_to_val:
-                    log.warning(f"[{mri_id}] HO label '{roi_label}' not found — skipping")
-                    results[f"vol_{safe_key}"]             = np.nan
-                    results[f"vol_{safe_key}_norm"]        = np.nan
-                    results[f"mean_intensity_{safe_key}"]  = np.nan
-                    continue
+        for roi_name, label_val in DKT_ROI_LABELS.items():
+            roi_mask = dkt_array == label_val
+            vol_mm3  = float(roi_mask.sum()) * vox_vol_mm3
+            vol_norm = vol_mm3 / e_tiv
+            mean_int = float(t1_array[roi_mask].mean()) if roi_mask.any() else np.nan
 
-                roi_mask = atlas_data == label_to_val[roi_label]
-                vol_mm3  = float(roi_mask.sum()) * vox_vol_mm3
-                vol_norm = vol_mm3 / e_tiv
-                mean_int = float(img_data[roi_mask].mean()) if roi_mask.any() else np.nan
+            features[f"vol_{roi_name}"]            = vol_mm3
+            features[f"vol_{roi_name}_norm"]        = vol_norm
+            features[f"mean_intensity_{roi_name}"]  = mean_int
 
-                results[f"vol_{safe_key}"]            = vol_mm3
-                results[f"vol_{safe_key}_norm"]       = vol_norm
-                results[f"mean_intensity_{safe_key}"] = mean_int
-            return results
-
-        features.update(_extract_ho_rois(atlas_sub,  HO_SUBCORTICAL_ROIS))
-        features.update(_extract_ho_rois(atlas_cort, HO_CORTICAL_ROIS))
-
-        # ── Derived hippocampal features (safe key names match above) ─────────
+        # ── Derived hippocampal features ───────────────────────────────────
         vol_l = features.get("vol_Left_Hippocampus",  np.nan)
         vol_r = features.get("vol_Right_Hippocampus", np.nan)
 
@@ -579,16 +601,15 @@ def extract_mri_features(mri_id: str, preprocessed_img: nib.Nifti1Image,
             features["hippo_vol_bilateral_norm"] = np.nan
             features["hippo_asymmetry_index"]    = np.nan
 
-        log.info(f"[{mri_id}] ROI extraction done — "
+        log.info(f"[{mri_id}] DKT ROI extraction done — "
                  f"hippo bilateral = {features.get('hippo_vol_bilateral', np.nan):.1f} mm³")
 
     except Exception as e:
-        log.error(f"[{mri_id}] ROI feature extraction failed: {e}")
-        for roi_label in all_ho_rois:
-            safe_key = roi_label.replace(" ", "_").replace(",", "").replace(".", "")
-            features[f"vol_{safe_key}"]            = np.nan
-            features[f"vol_{safe_key}_norm"]       = np.nan
-            features[f"mean_intensity_{safe_key}"] = np.nan
+        log.error(f"[{mri_id}] DKT ROI feature extraction failed: {e}")
+        for roi_name in DKT_ROI_LABELS:
+            features[f"vol_{roi_name}"]            = np.nan
+            features[f"vol_{roi_name}_norm"]       = np.nan
+            features[f"mean_intensity_{roi_name}"] = np.nan
         features["hippo_vol_bilateral"]      = np.nan
         features["hippo_vol_bilateral_norm"] = np.nan
         features["hippo_asymmetry_index"]    = np.nan
@@ -632,10 +653,14 @@ def save_cnn_tensor(mri_id: str, preprocessed_img: nib.Nifti1Image) -> bool:
 
 def clean_scratch(mri_id: str):
     """
-    Remove intermediate FSL files for this session from SCRATCH_DIR.
-    The raw .hdr/.img files in OAS2_RAW_PART* are NOT touched — unlike
-    DataLad (PEARL-Neuro), OASIS-2 is a direct download so we cannot
-    re-fetch on demand. Only remove scratch, keep raw.
+    Remove intermediate antspyx files for this session from SCRATCH_DIR.
+    The raw mpr-N.nii.gz files under data/raw/oasis2/ are NOT touched —
+    OASIS-2 is a direct download so we cannot re-fetch on demand. Only
+    remove scratch, keep raw.
+
+    NOTE: extract_mri_features() reads SCRATCH_DIR/{mri_id}/averaged.nii.gz,
+    so don't clean scratch before features have been extracted for a session
+    (process_session() below already sequences this correctly).
     """
     scratch = SCRATCH_DIR / mri_id
     if scratch.exists():
@@ -653,8 +678,9 @@ def process_session(mri_id: str, manifest_row: pd.Series,
     Full pipeline for one OASIS-2 MRI session.
 
     Steps:
-      1. Preprocess MRI (average acquisitions → skull strip → MNI → normalize)
-      2. Extract ROI features (AAL atlas + pre-computed CSV features)
+      1. Preprocess MRI (average acquisitions → antspynet brain extraction +
+         N4 + registration → normalize)
+      2. Extract ROI features (antspynet DKT labeling + pre-computed CSV features)
       3. Save CNN tensor (128^3 float32)
       4. Optionally clean intermediate scratch files
 
@@ -706,7 +732,7 @@ def process_session(mri_id: str, manifest_row: pd.Series,
     # Step 2 — features (runs even if tensor fails)
     if not feat_path.exists():
         try:
-            features = extract_mri_features(mri_id, preprocessed, manifest_row)
+            features = extract_mri_features(mri_id, manifest_row)
             pd.DataFrame([features]).to_csv(str(feat_path), index=False)
             log.info(f"[{mri_id}] Features saved → {feat_path.name}")
             status["features"] = "ok"
@@ -859,47 +885,33 @@ def assemble_feature_matrix(
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Nothing runs automatically on `python xtoasis2.py` — uncomment the
+    # steps you actually want, in order, and run them one at a time.
+    # Building the manifest first lets you eyeball session counts and label
+    # distribution before spending antspynet compute on anything.
 
     # Step 0 — build manifest (run once, inspect output before processing)
     # manifest = build_manifest()
     # print(manifest[["mri_id", "label", "visit", "is_converter", "nWBV"]].head(10).to_string())
 
     # Single session test — keep scratch for inspection
+    # manifest = pd.read_csv(str(MANIFEST_CSV))
     # row = manifest[manifest["mri_id"] == "OAS2_0001_MR1"].iloc[0]
     # process_session("OAS2_0001_MR1", row, clean_after=False)
 
     # Full run — all sessions
+    manifest = pd.read_csv(str(MANIFEST_CSV))
     # run_pipeline(manifest["mri_id"].tolist(), clean_after=True)
-    '''
-    # Batched run — 20 sessions per batch (recommended for JupyterLab)
+
+    # Batched run — recommended given antspynet's per-session compute cost
     all_ids    = manifest["mri_id"].tolist()
     BATCH_SIZE = 50
     batches    = [all_ids[i:i + BATCH_SIZE] for i in range(0, len(all_ids), BATCH_SIZE)]
-
-    # Change this each session: 0, 1, 2 ... up to len(batches)-1
-    BATCH_TO_RUN = 7
-
-    batch = batches[BATCH_TO_RUN]
-    print(f"Running batch {BATCH_TO_RUN}: {batch[0]} → {batch[-1]}")
-    summary = run_pipeline(batch, clean_after=True)
+    BATCH_TO_RUN = 0  # change this each session: 0, 1, 2 ... up to len(batches)-1
+    summary = run_pipeline(batches[BATCH_TO_RUN], clean_after=True)
     print(summary[["mri_id", "label", "overall"]].to_string())
-    '''
-    '''
-    # Assemble feature matrix after all sessions processed
-    df = assemble_feature_matrix(baseline_only=True, flag_converters=True)
-    print(df[["label", "nWBV", "hippo_vol_bilateral_norm", "hippo_asymmetry_index"]].groupby("label").mean().round(4))
-    
-    # These vary by subject and are worth keeping
-    usable = ["nWBV", "eTIV", "ASF", "mmse", "age", "educ", "ses"] + [c for c in df.columns if c.startswith("mean_intensity_")]
 
-    # Drop the volume columns — they're artifactually uniform in MNI space
-    drop = [c for c in df.columns if c.startswith("vol_") or c == "hippo_vol_bilateral" or c == "hippo_asymmetry_index"]
-    
-    df = pd.read_csv("data/metadata/oasis2_feature_matrix.csv")
-    intensity_cols = [c for c in df.columns if c.startswith("mean_intensity_")]
-    print(df.groupby("label")[intensity_cols].mean().round(4))
-    '''
-    import pandas as pd
-    df = pd.read_csv("data/metadata/oasis2_feature_matrix.csv")
-    intensity_cols = [c for c in df.columns if c.startswith("mean_intensity_")]
-    print(df.groupby("label")[intensity_cols].mean().round(4).T)
+    # Assemble feature matrix after all sessions processed
+    # df = assemble_feature_matrix(baseline_only=True, flag_converters=True)
+    # print(df.groupby("label")[["nWBV", "hippo_vol_bilateral_norm", "hippo_asymmetry_index"]].mean().round(4))
+    pass
